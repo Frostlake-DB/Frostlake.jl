@@ -1,0 +1,93 @@
+name: CI
+on:
+  push:
+    branches:
+      - master
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  # Skip intermediate builds: always.
+  # Cancel intermediate builds: only if it is a pull request build.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - engine ${{ matrix.engine }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions: # needed to allow julia-actions/cache to proactively delete old caches that it has created
+      actions: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '1.10'
+          - '1'
+        engine:
+          - '0.0.7'
+          - '0.1.0'
+        os:
+          - ubuntu-latest
+    env:
+      # The integration tests start a real engine from this release on Maven Central.
+      FROSTLAKE_ENGINE_VERSION: ${{ matrix.engine }}
+      JAVA_TOOL_OPTIONS: -Dsun.net.httpserver.nodelay=true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Resolve the engine classpath
+        run: |
+          mkdir -p "$RUNNER_TEMP/engine"
+          cat > "$RUNNER_TEMP/engine/pom.xml" <<EOF
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>ci</groupId>
+            <artifactId>engine</artifactId>
+            <version>1</version>
+            <dependencies>
+              <dependency>
+                <groupId>dev.frostlake</groupId>
+                <artifactId>frostlake-db</artifactId>
+                <version>${FROSTLAKE_ENGINE_VERSION}</version>
+              </dependency>
+            </dependencies>
+          </project>
+          EOF
+          mvn -q -B -f "$RUNNER_TEMP/engine/pom.xml" dependency:build-classpath \
+            -Dmdep.includeScope=runtime -Dmdep.outputFile="$RUNNER_TEMP/engine/classpath.txt"
+          echo "FROSTLAKE_CLASSPATH=$(cat "$RUNNER_TEMP/engine/classpath.txt")" >> "$GITHUB_ENV"
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v3
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+      - uses: julia-actions/julia-processcoverage@v1
+      - uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write # needed to allow julia-actions/cache to proactively delete old caches that it has created
+      contents: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v3
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-docdeploy@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}

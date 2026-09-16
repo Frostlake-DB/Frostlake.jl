@@ -33,10 +33,12 @@ end
                     execute(conn, "SELECT 1")
                     @test session_id(conn) isa String
                     @test !in_transaction(conn)
+                    @test repr(conn) == string("Connection(", base_url(conn), ")")
                 finally
                     close(conn)
                 end
                 @test !isopen(conn)
+                @test endswith(repr(conn), ", closed)")
                 # Closing twice is not an error; using a closed connection is.
                 @test close(conn) === nothing
                 @test_throws UsageError execute(conn, "SELECT 1")
@@ -47,6 +49,20 @@ end
                     c
                 end
                 @test !isopen(closed_inside)
+
+                # Connections with the same transport settings share one pool of
+                # sockets; a different setting gets a pool of its own.
+                a = Connection(server.dsn)
+                b = Connection(server.dsn)
+                c = Connection(server.dsn; connect_timeout=3)
+                try
+                    @test a.downloader === b.downloader
+                    @test a.downloader !== c.downloader
+                finally
+                    close(a)
+                    close(b)
+                    close(c)
+                end
             end
 
             @testset "the DSN's scope is applied before connect returns" begin
@@ -119,6 +135,34 @@ end
                 @test scalar(execute(conn, "SELECT COUNT(*) FROM grid")) == 2
             end
 
+            @testset "text and binary columns carry their declared width" begin
+                execute(conn, """CREATE OR REPLACE TABLE widths (
+                    s VARCHAR(9), b BINARY(5), n NUMBER(10,2), u VARCHAR)""")
+                result = execute(conn, "SELECT s, b, n, u FROM widths")
+                if result.columns[1].length === nothing
+                    # Engines before 0.1.0 send no length at all, and this driver
+                    # supports them: a column then reports none, and there is no
+                    # width to check. Skipped rather than passed — a green tick
+                    # would claim an engine had been checked for a width it never
+                    # sends.
+                    @info "skipping the declared widths: this engine sends no column length"
+                    # Characters for text, bytes for binary.
+                    @test_skip result.columns[1].length == 9
+                    @test_skip result.columns[2].length == 5
+                    # A column declared without a width still has the maximum one.
+                    @test_skip result.columns[4].length == 16777216
+                else
+                    # Characters for text, bytes for binary.
+                    @test result.columns[1].length == 9
+                    @test result.columns[2].length == 5
+                    # A column declared without a width still has the maximum one.
+                    @test result.columns[4].length == 16777216
+                end
+                # Every other type carries no width at all: unknown, not 0.
+                @test result.columns[3].length === nothing
+                @test result.columns[3].precision == 10
+            end
+
             @testset "types come back as themselves" begin
                 result = execute(conn, """
                     SELECT 42 AS i, 3.5 AS f, 'text' AS s, TRUE AS b, NULL AS n,
@@ -171,12 +215,16 @@ end
             end
 
             @testset "several statements in one request" begin
+                # A session runs one statement per request until it asks for more,
+                # so the pack below is refused on its count alone without this.
+                execute(conn, "ALTER SESSION SET MULTI_STATEMENT_COUNT = 0")
                 results = execute_all(conn, "SELECT 1; SELECT 2")
                 @test length(results) == 2
                 @test scalar(results[1]) == 1
                 @test scalar(results[2]) == 2
                 # `execute` hands back the first.
                 @test scalar(execute(conn, "SELECT 1; SELECT 2")) == 1
+                execute(conn, "ALTER SESSION SET MULTI_STATEMENT_COUNT = 1")
             end
 
             @testset "session state carries across statements" begin
@@ -305,6 +353,46 @@ end
                 @test_throws QueryError execute(conn, "SELECT ?")
             end
 
+            @testset "a pack declares its own count" begin
+                # Its own connection, so the session's MULTI_STATEMENT_COUNT is
+                # the default 1 and the request itself is the only thing that can
+                # have let the pack through.
+                Connection(server.dsn) do c
+                    results = execute_all(c, "SELECT 1 AS a; SELECT 2 AS b";
+                                          multi_statement_count=2)
+                    @test length(results) == 2
+                    @test scalar(results[1]) == 1
+                    @test scalar(results[2]) == 2
+
+                    # 0 is how a pack asks for any number.
+                    @test length(execute_all(c, "SELECT 1; SELECT 2; SELECT 3";
+                                             multi_statement_count=0)) == 3
+
+                    # The count did not stay behind: nothing was altered, so
+                    # there is nothing to put back.
+                    #
+                    # Only an engine that counts the statements in a request
+                    # refuses a pack at all, and this driver supports older ones
+                    # than that. Against one of those the refusal never comes, so
+                    # the check is skipped rather than passed: a green tick would
+                    # claim an engine had been checked for a refusal it does not
+                    # make.
+                    pack_refused = try
+                        execute_all(c, "SELECT 1; SELECT 2")
+                        false
+                    catch err
+                        err isa QueryError || rethrow()
+                        true
+                    end
+                    if pack_refused
+                        @test pack_refused
+                    else
+                        @info "skipping the refusal: this engine accepts a pack nobody asked for"
+                        @test_skip pack_refused
+                    end
+                end
+            end
+
             @testset "what the driver refuses to send" begin
                 @test_throws UsageError execute(conn, "SELECT ?", [1, 2])
                 @test_throws UsageError execute(conn, "SELECT ?", Dict("a" => 1))
@@ -317,6 +405,63 @@ end
         finally
             TestServer.stop(server)
         end
+    end
+
+    @testset "the statement count a request declares" begin
+        FakeServer.with_recorder() do port, requests
+            Connection("frostlake://127.0.0.1:$(port)") do conn
+                # The field is left out entirely, not sent as 0 or null: a
+                # request without it is the one the engine has always seen, and
+                # the session's MULTI_STATEMENT_COUNT decides.
+                execute(conn, "SELECT 1")
+                @test !occursin("multiStatementCount", requests[end])
+
+                execute_all(conn, "SELECT 1; SELECT 2"; multi_statement_count=2)
+                @test occursin("\"multiStatementCount\":2", requests[end])
+                # Nothing but the pack itself went out: the count rides on the
+                # request, so there is no ALTER SESSION to send and none to undo
+                # afterwards.
+                @test !occursin("ALTER SESSION", join(requests))
+
+                # 0 is a count like any other, and goes out as one.
+                execute_all(conn, "SELECT 1; SELECT 2"; multi_statement_count=0)
+                @test occursin("\"multiStatementCount\":0", requests[end])
+
+                # It declared that one request only.
+                execute(conn, "SELECT 3")
+                @test !occursin("multiStatementCount", requests[end])
+
+                # Named and positional binds carry it too.
+                execute(conn, "SELECT ?", [1]; multi_statement_count=1)
+                @test occursin("\"multiStatementCount\":1", requests[end])
+                execute(conn, "SELECT :a", (a=1,); multi_statement_count=1)
+                @test occursin("\"multiStatementCount\":1", requests[end])
+
+                @test_throws UsageError execute(conn, "SELECT 1"; multi_statement_count=-1)
+                @test_throws UsageError execute(conn, "SELECT 1"; multi_statement_count=1.5)
+                @test_throws UsageError execute(conn, "SELECT 1"; multi_statement_count="2")
+            end
+        end
+    end
+
+    @testset "refused before anything is sent" begin
+        # TLS options on a plain HTTP DSN are a mistake, not something to ignore.
+        @test_throws UsageError Connection("frostlake://127.0.0.1:1"; cacert="/nonexistent.pem")
+        @test_throws UsageError Connection("frostlake://127.0.0.1:1"; verify_certificate=false)
+    end
+
+    @testset "how failures are worded" begin
+        @test Frostlake._describe(0.25) == "250ms"
+        @test Frostlake._describe(2.0) == "2s"
+        @test Frostlake._describe(1.5) == "1.5s"
+        # A count can arrive as a float; only a whole one is a count.
+        @test Frostlake._as_int(38.0) == 38
+        @test Frostlake._as_int(1.5) === nothing
+        @test Frostlake._as_int(Inf) === nothing
+        # A failed answer that carries no message still says what happened.
+        @test Frostlake._failure_message(Dict{String,Any}("success" => false), 500,
+                                         "{\"success\":false}") ==
+              "the statement failed with HTTP 500 and no error message: {\"success\":false}"
     end
 
     @testset "transport failures" begin

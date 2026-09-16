@@ -63,8 +63,8 @@ end
 ```
 
 Every keyword may also be given in the DSN query string, where an explicit
-keyword outranks it. Timeouts are seconds, or any `Dates.Period`; `0` removes
-the bound.
+keyword outranks it. Timeouts are seconds, or a fixed-length `Dates.Period`
+such as `Minute(10)`; `0` removes the bound.
 
 | Keyword | Meaning |
 | --- | --- |
@@ -122,10 +122,28 @@ end
 Connection(dsn::AbstractString; kwargs...) = connect(dsn; kwargs...)
 Connection(f::Function, dsn::AbstractString; kwargs...) = connect(f, dsn; kwargs...)
 
+# Connections with the same transport settings share one Downloader, and with it
+# libcurl's pool of keep-alive sockets. A Downloader of its own per connection
+# would leave every closed connection's idle sockets open until the grace period
+# or the collector reached them; enough of those and a request on a newer
+# connection fails with "select/poll returned error" under Julia 1.10's libcurl.
+# The key holds everything the easy-handle hook reads, so connections that differ
+# in any of it get a Downloader of their own.
+const _DOWNLOADERS = Dict{Tuple{Int,Union{String,Nothing},Bool},Downloads.Downloader}()
+const _DOWNLOADERS_LOCK = ReentrantLock()
+
 function _downloader(config::Config, cacert, verify_certificate)
+    key = (round(Int, config.connect_timeout * 1000),
+           cacert === nothing ? nothing : String(cacert),
+           verify_certificate === false)
+    return lock(_DOWNLOADERS_LOCK) do
+        get!(() -> _new_downloader(key...), _DOWNLOADERS, key)
+    end
+end
+
+function _new_downloader(connect_ms::Int, cacert::Union{String,Nothing}, skip_verify::Bool)
     downloader = Downloads.Downloader()
-    cacert === nothing || (downloader.ca_roots = String(cacert))
-    connect_ms = round(Int, config.connect_timeout * 1000)
+    cacert === nothing || (downloader.ca_roots = cacert)
     # libcurl's connect timeout and certificate checking have no keyword on
     # `Downloads.request`, so they are set on the easy handle. A Julia that has
     # moved the hook is not a reason to refuse to connect — the request-level
@@ -134,14 +152,13 @@ function _downloader(config::Config, cacert, verify_certificate)
         downloader.easy_hook = (easy, info) -> begin
             connect_ms > 0 &&
                 Downloads.Curl.setopt(easy, Downloads.Curl.CURLOPT_CONNECTTIMEOUT_MS, connect_ms)
-            if verify_certificate === false
+            if skip_verify
                 Downloads.Curl.setopt(easy, Downloads.Curl.CURLOPT_SSL_VERIFYPEER, 0)
                 Downloads.Curl.setopt(easy, Downloads.Curl.CURLOPT_SSL_VERIFYHOST, 0)
             end
         end
     catch
-        verify_certificate === false &&
-            throw(UsageError("this Julia cannot turn certificate verification off"))
+        skip_verify && throw(UsageError("this Julia cannot turn certificate verification off"))
     end
     return downloader
 end
@@ -166,14 +183,16 @@ Base.show(io::IO, conn::Connection) =
 Closes the connection.
 
 The HTTP API has no endpoint for ending a session, so the engine's own idle
-sweep is what reclaims the session behind it; closing releases the client's
-sockets and lets the next statement on this object fail loudly rather than
-quietly opening a second session. Closing twice is not an error.
+sweep is what reclaims the session behind it; closing lets the next statement on
+this object fail loudly rather than quietly opening a second session. The
+sockets belong to a pool shared by every connection with the same transport
+settings, and an idle one is closed 30 seconds after the pool's last request.
+Closing twice is not an error.
 """
 function Base.close(conn::Connection)
     conn.closed && return nothing
-    # Let a statement already in flight finish before the sockets go, so its
-    # caller gets an answer rather than a torn connection.
+    # Let a statement already in flight finish first, so its caller gets an
+    # answer rather than a torn connection.
     lock(conn.lock) do
         conn.closed = true
         conn.downloader = nothing
@@ -185,8 +204,8 @@ _check_open(conn::Connection) =
     conn.closed && throw(UsageError("the connection is closed"))
 
 """
-    execute(conn, sql) -> Result
-    execute(conn, sql, parameters) -> Result
+    execute(conn, sql; multi_statement_count=nothing) -> Result
+    execute(conn, sql, parameters; multi_statement_count=nothing) -> Result
 
 Runs one statement and returns its first result set.
 
@@ -201,48 +220,82 @@ execute(conn, "INSERT INTO people VALUES (?, ?)", [1, "Ada"])
 execute(conn, "SELECT :a + :b AS total", (a=2, b=40))
 ```
 
+`multi_statement_count` says how many statements this one request carries; see
+[`execute_all`](@ref).
+
 A string holding several `;`-separated statements answers with the first one's
 result — use [`execute_all`](@ref) for the rest.
 """
-execute(conn::Connection, sql::AbstractString) = first(execute_all(conn, sql))
-execute(conn::Connection, sql::AbstractString, parameters) =
-    first(execute_all(conn, sql, parameters))
+execute(conn::Connection, sql::AbstractString; multi_statement_count=nothing) =
+    first(execute_all(conn, sql; multi_statement_count=multi_statement_count))
+execute(conn::Connection, sql::AbstractString, parameters; multi_statement_count=nothing) =
+    first(execute_all(conn, sql, parameters; multi_statement_count=multi_statement_count))
 
 """
-    execute_all(conn, sql) -> Vector{Result}
-    execute_all(conn, sql, parameters) -> Vector{Result}
+    execute_all(conn, sql; multi_statement_count=nothing) -> Vector{Result}
+    execute_all(conn, sql, parameters; multi_statement_count=nothing) -> Vector{Result}
 
 Runs a statement string and returns every result set it produced, in order. A
 single statement gives a one-element vector.
+
+The engine refuses a request holding more statements than it was told to expect,
+so a pack says how many it holds:
+
+```julia
+execute_all(conn, "SELECT 1; SELECT 2"; multi_statement_count=2)
+```
+
+The count travels with this one request. It outranks the session's
+`MULTI_STATEMENT_COUNT` without changing it, so there is nothing to put back
+afterwards, and `0` allows any number. Left out, no count is sent at all and the
+session's value decides.
 """
-function execute_all(conn::Connection, sql::AbstractString)
+function execute_all(conn::Connection, sql::AbstractString; multi_statement_count=nothing)
     text = String(sql)
     # With no parameters the markers are the server's and pass through verbatim;
     # the render call still refuses a statement mixing the two placeholder styles.
-    return _run(conn, text, substitute_positional(text, ()))
+    return _run(conn, text, substitute_positional(text, ()),
+                _statement_count(multi_statement_count))
 end
 
-function execute_all(conn::Connection, sql::AbstractString, parameters::Union{AbstractVector,Tuple})
+function execute_all(conn::Connection, sql::AbstractString,
+                     parameters::Union{AbstractVector,Tuple}; multi_statement_count=nothing)
     text = String(sql)
-    return _run(conn, text, substitute_positional(text, parameters))
+    return _run(conn, text, substitute_positional(text, parameters),
+                _statement_count(multi_statement_count))
 end
 
-function execute_all(conn::Connection, sql::AbstractString, parameters::AbstractDict)
+function execute_all(conn::Connection, sql::AbstractString, parameters::AbstractDict;
+                     multi_statement_count=nothing)
     text = String(sql)
-    return _run(conn, text, substitute_named(text, parameters))
+    return _run(conn, text, substitute_named(text, parameters),
+                _statement_count(multi_statement_count))
 end
 
-execute_all(conn::Connection, sql::AbstractString, parameters::NamedTuple) =
-    execute_all(conn, sql, Dict{String,Any}(string(k) => v for (k, v) in pairs(parameters)))
+execute_all(conn::Connection, sql::AbstractString, parameters::NamedTuple;
+            multi_statement_count=nothing) =
+    execute_all(conn, sql, Dict{String,Any}(string(k) => v for (k, v) in pairs(parameters));
+                multi_statement_count=multi_statement_count)
 
 # Anything else is a mistake worth naming. A bare `MethodError` would say which
 # signatures exist; this says what to pass.
-execute_all(::Connection, ::AbstractString, parameters) =
+execute_all(::Connection, ::AbstractString, parameters; multi_statement_count=nothing) =
     throw(UsageError(string("parameters must be a vector or tuple for ? placeholders, or a ",
                             "dictionary or named tuple for :name placeholders, got ",
                             typeof(parameters))))
 
-function _run(conn::Connection, sql::String, rendered::String)
+# The statement count a call declares, checked here so a bad value is a usage
+# error rather than a request body the engine cannot read.
+function _statement_count(given)
+    given === nothing && return nothing
+    (given isa Integer && !(given isa Bool) && given >= 0) || throw(UsageError(
+        string("multi_statement_count must be a whole number of statements, 0 for any ",
+               "number, got ", repr(given))))
+    return Int(given)
+end
+
+function _run(conn::Connection, sql::String, rendered::String,
+              multi_statement_count::Union{Int,Nothing}=nothing)
     _check_open(conn)
     # The pending USE statements and the statement itself have to reach the
     # session as one unit: another caller must not slip a query in between, and
@@ -250,8 +303,10 @@ function _run(conn::Connection, sql::String, rendered::String)
     return lock(conn.lock) do
         _check_open(conn)
         _restore_session_defaults(conn)
+        # The pending USE statements are one statement each, whatever this
+        # request declares, so the count goes only on the caller's own.
         _drain_pending_use(conn)
-        body = _round_trip(conn, rendered)
+        body = _round_trip(conn, rendered, multi_statement_count)
         changes_session_scope(sql) && (conn.session_touched = true)
         return _shape_results(body)
     end
@@ -409,12 +464,18 @@ end
 
 # ---------------------------------------------------------------- transport
 
-function _round_trip(conn::Connection, sql::String)
+function _round_trip(conn::Connection, sql::String,
+                     multi_statement_count::Union{Int,Nothing}=nothing)
     endpoint = string(base_url(conn.config), "/api/execute")
     payload = string("{\"sql\":", json_encode(sql),
                      conn.sessionid === nothing ? "" :
                      string(",\"sessionId\":", json_encode(conn.sessionid)),
-                     ",\"autoCommit\":", conn.autocommit ? "true" : "false", "}")
+                     ",\"autoCommit\":", conn.autocommit ? "true" : "false",
+                     # Absent unless the caller asked for a count: a request
+                     # without the field is the one the server has always seen,
+                     # and the session's value decides.
+                     multi_statement_count === nothing ? "" :
+                     string(",\"multiStatementCount\":", multi_statement_count), "}")
 
     status, body = _post(conn, endpoint, payload)
     decoded = _decode_body(endpoint, status, body)
@@ -523,6 +584,9 @@ function _shape_result(set::AbstractDict)
                 get(column, "nullable", nothing) isa Bool ? column["nullable"] : nothing,
                 _as_int(get(column, "precision", nothing)),
                 _as_int(get(column, "scale", nothing)),
+                # Text and binary columns only; every other type omits it, and
+                # so does a server that predates the field.
+                _as_int(get(column, "length", nothing)),
             ))
         end
     end

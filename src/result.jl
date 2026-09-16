@@ -5,11 +5,20 @@
 
 What the engine reported about one column of a result set: its `name` as the
 engine cased it, the declared `datatype` (`NUMBER`, `VARCHAR`,
-`TIMESTAMP_NTZ`, ...), whether it is `nullable`, and the `precision` and `scale`
-of the fixed-point numerics.
+`TIMESTAMP_NTZ`, ...), whether it is `nullable`, the `precision` and `scale`
+of the fixed-point numerics, and the `length` of the text and binary ones.
 
-`nullable`, `precision` and `scale` are `nothing` when the server did not say —
-an engine that predates a field reports nothing rather than `false` or `0`.
+`length` counts characters for a `VARCHAR` and bytes for a `BINARY`, and is
+what the account's own driver reports as such a column's precision and its
+display size: `VARCHAR(9)` is `9`. A table column declared without a width
+carries 16777216 characters or 8388608 bytes; a cast without one, such as
+`'abc'::VARCHAR`, reports 134217728 characters or 67108864 bytes, and a string
+literal its own length. Only those two families carry it; every other type
+leaves it `nothing`.
+
+`nullable`, `precision`, `scale` and `length` are `nothing` when the server did
+not say — an engine that predates a field reports nothing rather than `false`
+or `0`.
 """
 struct ColumnInfo
     name::String
@@ -17,11 +26,12 @@ struct ColumnInfo
     nullable::Union{Bool,Nothing}
     precision::Union{Int,Nothing}
     scale::Union{Int,Nothing}
+    length::Union{Int,Nothing}
 end
 
 ColumnInfo(name::AbstractString, datatype::AbstractString; nullable=nothing,
-           precision=nothing, scale=nothing) =
-    ColumnInfo(String(name), String(datatype), nullable, precision, scale)
+           precision=nothing, scale=nothing, length=nothing) =
+    ColumnInfo(String(name), String(datatype), nullable, precision, scale, length)
 
 Base.show(io::IO, c::ColumnInfo) = print(io, c.name, " ", c.datatype)
 

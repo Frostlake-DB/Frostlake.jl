@@ -1,5 +1,6 @@
 using Test
-using Frostlake: parse_dsn, base_url, use_statements, quote_identifier, UsageError
+using Dates
+using Frostlake: parse_dsn, base_url, use_statements, quote_identifier, UsageError, _seconds
 
 @testset "dsn" begin
     @testset "host and port" begin
@@ -104,5 +105,20 @@ using Frostlake: parse_dsn, base_url, use_statements, quote_identifier, UsageErr
         @test use_statements(parse_dsn("frostlake://h/select")) == ["USE DATABASE \"SELECT\""]
         @test use_statements(parse_dsn("frostlake://h/My%20Db")) == ["USE DATABASE \"My Db\""]
         @test use_statements(parse_dsn("frostlake://h/żółw")) == ["USE DATABASE \"żółw\""]
+    end
+
+    @testset "a parameter without a value" begin
+        @test_throws UsageError parse_dsn("frostlake://h?tls")
+        @test_throws UsageError parse_dsn("frostlake://h?schema")
+    end
+
+    @testset "timeouts given as periods" begin
+        @test _seconds(30) == 30.0
+        @test _seconds(Minute(10)) == 600.0
+        @test _seconds(Millisecond(1500)) == 1.5
+        @test _seconds(nothing) === nothing
+        # A month or a year has no fixed length, so it names no timeout.
+        @test_throws UsageError _seconds(Month(1))
+        @test_throws UsageError _seconds(Year(1))
     end
 end

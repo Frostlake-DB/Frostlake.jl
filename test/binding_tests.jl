@@ -141,4 +141,8 @@ using Frostlake: scan_placeholders, placeholder_count, placeholder_names,
         # One statement, not two: the quote was doubled rather than closed.
         @test length(split_statements(rendered)) == 1
     end
+
+    @testset "one placeholder style per statement" begin
+        @test_throws UsageError substitute_named("SELECT ?, :a", Dict("a" => 1))
+    end
 end

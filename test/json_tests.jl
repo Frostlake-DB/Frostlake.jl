@@ -1,6 +1,6 @@
 using Test
 using Frostlake: json_decode, json_encode, JSONNumber, JSONUndefined, JSONParseError,
-                 isintegral, asint, asbig, asfloat, UsageError
+                 isintegral, asint, asbig, asfloat, aswhole, UsageError
 
 @testset "json" begin
     @testset "scalars" begin
@@ -107,5 +107,46 @@ using Frostlake: json_decode, json_encode, JSONNumber, JSONUndefined, JSONParseE
                      "{\"a\":[1,2,{\"b\":\"żółw\"}]}")
             @test json_encode(json_decode(text)) == text
         end
+    end
+
+    @testset "whole numbers in other spellings" begin
+        # An engine that produces BigDecimals writes a whole value as `1E+3` or
+        # `12.000`; an integral column still reads it exactly.
+        @test aswhole(JSONNumber("42")) === 42
+        @test aswhole(JSONNumber("123456789012345678901234567890")) ==
+              big"123456789012345678901234567890"
+        @test aswhole(JSONNumber("1E+3")) === 1000
+        @test aswhole(JSONNumber("1.2E+5")) === 120000
+        @test aswhole(JSONNumber("12.000")) === 12
+        @test aswhole(JSONNumber("-1.50E+1")) === -15
+        @test aswhole(JSONNumber("0E-3")) === 0
+        @test aswhole(JSONNumber("1E+30")) == big"1000000000000000000000000000000"
+        @test aswhole(JSONNumber("1E+30")) isa BigInt
+        # Genuinely fractional, or wider than any NUMBER: not a whole number.
+        @test aswhole(JSONNumber("12.5")) === nothing
+        @test aswhole(JSONNumber("5E-3")) === nothing
+        @test aswhole(JSONNumber("1E+100")) === nothing
+        @test aswhole(JSONNumber("1E+99999999999999999999")) === nothing
+    end
+
+    @testset "a missing separator is reported where it was expected" begin
+        @test_throws JSONParseError json_decode("{\"a\":1 \"b\":2}")
+        @test_throws JSONParseError json_decode("[1 2]")
+        err = try
+            json_decode("[1 2]")
+        catch e
+            e
+        end
+        @test startswith(sprint(showerror, err), "JSONParseError: ")
+        @test occursin("at offset", sprint(showerror, err))
+    end
+
+    @testset "less common escapes and values" begin
+        # A high surrogate without its low half keeps both escapes, the lone half
+        # as the replacement character.
+        @test json_decode("\"\\uD83D\\u0041\"") == "�A"
+        @test json_encode("a\rb\bc\fd") == "\"a\\rb\\bc\\fd\""
+        @test json_encode(JSONUndefined()) == "null"
+        @test sprint(show, JSONNumber("1.50")) == "1.50"
     end
 end

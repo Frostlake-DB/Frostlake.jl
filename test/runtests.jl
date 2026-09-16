@@ -11,6 +11,7 @@ include("fakeserver.jl")
     include("binding_tests.jl")
     include("values_tests.jl")
     include("result_tests.jl")
+    include("errors_tests.jl")
 
     # These boot a real engine from FROSTLAKE_CLASSPATH, and skip without one.
     include("connection_tests.jl")

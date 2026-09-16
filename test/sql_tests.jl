@@ -85,4 +85,12 @@ using Frostlake: skip_enclosure, skip_string, skip_quoted, skip_dollar_quoted,
         @test leading_words("'literal'", 3) == String[]
         @test length(leading_words("a b c d e f g", 4)) == 4
     end
+
+    @testset "unfinished text" begin
+        # An unterminated quoted identifier runs to the end rather than looping.
+        @test skip_enclosure("\"abc", 1) == 5
+        # A verb whose object is never named leaves the scope alone.
+        @test !changes_session_scope("DROP IF EXISTS")
+        @test !changes_session_scope("CREATE OR REPLACE")
+    end
 end

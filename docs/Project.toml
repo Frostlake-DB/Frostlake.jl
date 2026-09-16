@@ -1,0 +1,9 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+Frostlake = "40092d52-7b49-45a8-b7a0-7762832bafd1"
+
+[compat]
+Documenter = "1"
+
+[sources]
+Frostlake = {path = ".."}

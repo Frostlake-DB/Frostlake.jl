@@ -6,8 +6,8 @@ using Frostlake: ColumnInfo, ZonedTimestamp, utc, convert_cell, base_type_name,
                  decode_hex, format_time, format_naive, format_zoned,
                  json_decode, JSONUndefined
 
-column(datatype; precision=nothing, scale=nothing) =
-    ColumnInfo("C", datatype, nothing, precision, scale)
+column(datatype; precision=nothing, scale=nothing, length=nothing) =
+    ColumnInfo("C", datatype, nothing, precision, scale, length)
 
 cell(text, datatype; scale=nothing) =
     convert_cell(json_decode(text), column(datatype; scale=scale))
@@ -127,5 +127,28 @@ cell(text, datatype; scale=nothing) =
         # What the engine printed reads back to the same value.
         @test format_zoned(parse_zoned("2024-01-15 10:30:45.123 +0100")) ==
               "2024-01-15 10:30:45.123 +01:00"
+        @test sprint(show, parse_zoned("2024-01-15 10:30:00 +01:00")) ==
+              "ZonedTimestamp(2024-01-15 10:30:00.000 +01:00)"
+    end
+
+    @testset "non-finite doubles arrive as text" begin
+        # The engine writes NaN and the infinities as JSON strings, even in a
+        # FLOAT column; there they read back as the doubles they name.
+        @test isnan(cell("\"NaN\"", "FLOAT"))
+        @test cell("\"Infinity\"", "DOUBLE") == Inf
+        @test cell("\"-Infinity\"", "FLOAT") == -Inf
+        @test cell("\"inf\"", "FLOAT") == Inf
+        # Any other text in such a column stays text, and so does NaN elsewhere.
+        @test cell("\"n/a\"", "FLOAT") == "n/a"
+        @test cell("\"NaN\"", "VARCHAR") == "NaN"
+        # A cell that is already a number is left as it is.
+        @test convert_cell(3.5, column("FLOAT")) === 3.5
+    end
+
+    @testset "out-of-range temporals keep their text" begin
+        # `Dates` refuses these fields outright; the text is still worth having.
+        @test cell("\"24:00:00\"", "TIME") == "24:00:00"
+        @test cell("\"2024-02-30\"", "DATE") == "2024-02-30"
+        @test parse_temporal("2024-01-15", :none) === nothing
     end
 end
