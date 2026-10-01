@@ -7,6 +7,9 @@
 "How much of an unrecognisable response is quoted back in an error."
 const MAX_ERROR_BODY = 512
 
+"The longest `close` waits for the engine to release a session, in seconds."
+const RELEASE_LIMIT = 5.0
+
 """
     Connection
 
@@ -17,7 +20,14 @@ answer, so session state — `USE`, session variables, an open transaction —
 carries from one statement to the next, which is exactly what a half-interleaved
 second statement would break.
 
-Build one with `Connection(dsn)` and release it with `close`.
+The engine can lose the session: it expires after 30 idle minutes, and a restart
+ends them all. A statement that finds its session gone is sent once more on a
+fresh session with the DSN's scope, unless the lost session held an open
+transaction or context of the caller's own — then it throws
+[`SessionLostError`](@ref) instead.
+
+Build one with `Connection(dsn)` and release it with `close`, which also releases
+the engine session.
 """
 mutable struct Connection
     config::Config
@@ -35,6 +45,12 @@ mutable struct Connection
     last_used_at::Union{UInt64,Nothing}
     "Whether the caller has selected a scope themselves; if they have, the DSN's defaults are no longer the whole truth about this session."
     session_touched::Bool
+    "Whether the engine reports `newSession` — which arrived together with `requireSession` and `DELETE /api/sessions/{id}` — or `nothing` until the first answer that names a session settles it."
+    tracks_sessions::Union{Bool,Nothing}
+    "Set once a statement left state behind that a fresh session would not have (see `touches_session`); cleared when the DSN's scope goes back on."
+    dirty::Bool
+    "Whether a transaction is open: set by a `BEGIN` or `START TRANSACTION` that succeeded, cleared by a `COMMIT` or `ROLLBACK`, however each was sent."
+    transaction_open::Bool
 end
 
 """
@@ -70,7 +86,7 @@ such as `Minute(10)`; `0` removes the bound.
 | --- | --- |
 | `timeout` | how long one statement may take |
 | `connect_timeout` | how long to wait for the socket |
-| `idle_limit` | how long a connection may idle before its scope is re-applied |
+| `idle_limit` | against an engine before 0.1.0, how long a connection may idle before its scope is re-applied |
 | `cacert` | a CA bundle for HTTPS, instead of the system's |
 | `verify_certificate` | `false` to accept any HTTPS certificate |
 """
@@ -96,7 +112,7 @@ function connect(dsn::AbstractString; timeout=nothing, connect_timeout=nothing,
     pending = use_statements(config)
     conn = Connection(config, _downloader(config, cacert, verify_certificate),
                       ReentrantLock(), nothing, true, false, pending, copy(pending),
-                      nothing, false)
+                      nothing, false, nothing, false, false)
     try
         ping(conn)
         apply_dsn_scope(conn)
@@ -180,24 +196,69 @@ Base.show(io::IO, conn::Connection) =
 """
     close(conn)
 
-Closes the connection.
+Closes the connection, releasing the engine session behind it.
 
-The HTTP API has no endpoint for ending a session, so the engine's own idle
-sweep is what reclaims the session behind it; closing lets the next statement on
-this object fail loudly rather than quietly opening a second session. The
-sockets belong to a pool shared by every connection with the same transport
-settings, and an idle one is closed 30 seconds after the pool's last request.
-Closing twice is not an error.
+The release is one `DELETE /api/sessions/{id}`, which also rolls back a
+transaction left open on the session. It is a courtesy: bounded to five seconds
+(less when the connection's `timeout` is shorter), and a release that fails or
+never answers is not an error — the engine expires the session on its own. An
+engine before 0.1.0 has no such endpoint and is sent nothing; its session
+lingers until that expiry, as it always did.
+
+Closing lets the next statement on this object fail loudly rather than quietly
+opening a second session. The sockets belong to a pool shared by every
+connection with the same transport settings, and an idle one is closed 30
+seconds after the pool's last request. Closing twice is not an error, and sends
+nothing the second time.
 """
 function Base.close(conn::Connection)
     conn.closed && return nothing
     # Let a statement already in flight finish first, so its caller gets an
     # answer rather than a torn connection.
     lock(conn.lock) do
+        conn.closed && return
         conn.closed = true
+        _release(conn)
         conn.downloader = nothing
     end
     return nothing
+end
+
+# Sends the DELETE that ends the session, when there is one to end and the
+# engine is known to have the endpoint. Never throws: whatever became of it, the
+# connection is closed, and a session the engine did not release expires on its
+# own.
+function _release(conn::Connection)
+    id = conn.sessionid
+    conn.sessionid = nothing
+    conn.transaction_open = false
+    (id === nothing || conn.tracks_sessions !== true) && return nothing
+    downloader = conn.downloader
+    downloader === nothing && return nothing
+    limit = conn.config.timeout
+    budget = (limit == 0 || limit > RELEASE_LIMIT) ? RELEASE_LIMIT : limit
+    endpoint = string(base_url(conn.config), "/api/sessions/", _escape_segment(id))
+    try
+        Downloads.request(endpoint; method="DELETE", output=devnull, timeout=budget,
+                          throw=false, downloader=downloader)
+    catch
+    end
+    return nothing
+end
+
+# A session id as one path segment: anything but an unreserved character is
+# percent-encoded.
+function _escape_segment(text::AbstractString)
+    io = IOBuffer()
+    for byte in codeunits(text)
+        c = Char(byte)
+        if isascii(c) && (isletter(c) || isdigit(c) || c in ('-', '.', '_', '~'))
+            write(io, c)
+        else
+            print(io, '%', uppercase(string(byte; base=16, pad=2)))
+        end
+    end
+    return String(take!(io))
 end
 
 _check_open(conn::Connection) =
@@ -305,21 +366,103 @@ function _run(conn::Connection, sql::String, rendered::String,
         _restore_session_defaults(conn)
         # The pending USE statements are one statement each, whatever this
         # request declares, so the count goes only on the caller's own.
-        _drain_pending_use(conn)
-        body = _round_trip(conn, rendered, multi_statement_count)
+        body = _statement(conn, rendered, multi_statement_count; scoped=true)
         changes_session_scope(sql) && (conn.session_touched = true)
+        _track(conn, sql)
         return _shape_results(body)
     end
 end
 
+# Sends one statement of the caller's — after the pending DSN scope when
+# `scoped` — and replaces a session the engine no longer holds.
+#
+# The engine answers 404 to a request that requires a session it does not have,
+# and runs nothing. When the lost session held nothing a fresh one could not
+# reproduce, the DSN's scope goes onto a fresh session and the statement is sent
+# once more; otherwise `_lose_session` throws.
+function _statement(conn::Connection, sql::String,
+                    multi_statement_count::Union{Int,Nothing}=nothing;
+                    autocommit::Union{Bool,Nothing}=nothing, scoped::Bool=false)
+    answer = _unit(conn, sql, multi_statement_count, autocommit, scoped)
+    answer === nothing || return answer
+    _lose_session(conn, sql)
+    answer = _unit(conn, sql, multi_statement_count, autocommit, true)
+    answer === nothing || return answer
+    conn.sessionid = nothing
+    _start_over(conn)
+    throw(SessionLostError("the engine refused a session it had just started", sql))
+end
+
+# The pending DSN scope when `scoped`, then `sql`: `nothing` when the engine
+# refused the session as unknown on any of them, so that neither that request
+# nor anything after it ran.
+function _unit(conn::Connection, sql::String, multi_statement_count, autocommit,
+               scoped::Bool)
+    scoped && !_drain_pending_use(conn) && return nothing
+    return _round_trip(conn, sql, multi_statement_count; autocommit=autocommit)
+end
+
 # Each USE leaves the queue only once it has succeeded. A DSN naming a database
 # that does not exist has to keep failing; the alternative is later statements
-# quietly running in the default scope.
+# quietly running in the default scope. `false` when the engine refused the
+# session as unknown.
 function _drain_pending_use(conn::Connection)
     while !isempty(conn.pending_use)
-        _round_trip(conn, conn.pending_use[1])
-        popfirst!(conn.pending_use)
+        queue = conn.pending_use
+        _round_trip(conn, queue[1]) === nothing && return false
+        # An answer saying the engine replaced the session queued the whole scope
+        # afresh, and that queue starts from the top.
+        queue === conn.pending_use && popfirst!(queue)
     end
+    return true
+end
+
+# The engine no longer holds the session — it expired, was released, or the
+# server restarted — and nothing ran. The next request starts a fresh session on
+# the DSN's scope.
+#
+# With an open transaction or a moved context gone with it, re-running the
+# statement would put it somewhere its author did not intend, so that is refused
+# here rather than done.
+function _lose_session(conn::Connection, sql::String)
+    had_transaction = conn.transaction_open || !conn.autocommit
+    had_context = conn.dirty
+    conn.sessionid = nothing
+    _start_over(conn)
+    if had_transaction
+        conn.autocommit = true
+        throw(SessionLostError(string(
+            "the engine no longer holds this connection's session (it expired, was ",
+            "released, or the server restarted), so its open transaction is gone; the ",
+            "statement did not run"), sql))
+    end
+    had_context && throw(SessionLostError(string(
+        "the engine no longer holds this connection's session (it expired, was ",
+        "released, or the server restarted), and the context set up on it (USE, SET, ",
+        "ALTER SESSION or a temporary object) went with it, so the statement was not ",
+        "re-run; the next statement starts a fresh session on the connection's scope"), sql))
+    return nothing
+end
+
+# Forgets what the session held: the one the next statement meets is fresh, and
+# gets the DSN's scope first.
+function _start_over(conn::Connection)
+    conn.dirty = false
+    conn.transaction_open = false
+    conn.session_touched = false
+    conn.pending_use = copy(conn.session_defaults)
+    return nothing
+end
+
+# Follows what a statement that succeeded did to the session.
+function _track(conn::Connection, sql::String)
+    for statement in split_statements(sql)
+        touches_session(statement) && (conn.dirty = true)
+        effect = transaction_effect(statement)
+        effect === :begins && (conn.transaction_open = true)
+        effect === :ends && (conn.transaction_open = false)
+    end
+    return nothing
 end
 
 """
@@ -337,7 +480,18 @@ function apply_dsn_scope(conn::Connection)
         # without this a second call would send nothing and report success.
         conn.pending_use = copy(conn.session_defaults)
         conn.session_touched = false
-        _drain_pending_use(conn)
+        if !_drain_pending_use(conn)
+            # The refused USE is still at the head of the queue.
+            refused = conn.pending_use[1]
+            _lose_session(conn, refused)
+            if !_drain_pending_use(conn)
+                conn.sessionid = nothing
+                _start_over(conn)
+                throw(SessionLostError("the engine refused a session it had just started",
+                                       refused))
+            end
+        end
+        conn.dirty = false
     end
     return nothing
 end
@@ -363,15 +517,20 @@ function ping(conn::Connection)
     return nothing
 end
 
-# The engine reclaims a session once it has been idle long enough, then quietly
-# builds a fresh one for the id we keep sending — losing the scope we selected.
-# Nothing in the reply gives it away: the id we sent is echoed back either way.
-# So past the limit the only safe reading is that the session is new, and the
-# DSN's defaults go back on.
+# An engine before 0.1.0 reclaims a session once it has been idle long enough,
+# then quietly builds a fresh one for the id we keep sending — losing the scope
+# we selected. Nothing in the reply gives it away: the id we sent is echoed back
+# either way. So past the limit the only safe reading is that the session is
+# new, and the DSN's defaults go back on.
 #
 # Not once the caller has selected a scope themselves: putting our defaults over
 # their choice is its own surprise.
+#
+# An engine that reports `newSession` needs no clock: the connection requires
+# its session, so a lost one is refused rather than rebuilt, and the statement
+# that finds it gone puts the scope back (see `_statement`).
 function _restore_session_defaults(conn::Connection)
+    conn.tracks_sessions === false || return nothing
     (isempty(conn.session_defaults) || conn.session_touched) && return nothing
     conn.config.idle_limit == 0 && return nothing
     last = conn.last_used_at
@@ -392,13 +551,11 @@ Opens a transaction: autocommit goes off and `BEGIN` is sent.
 function begin_transaction(conn::Connection)
     _check_open(conn)
     lock(conn.lock) do
+        # BEGIN travels with autocommit off, the mode the transaction runs in;
+        # the connection takes that mode on only once BEGIN has succeeded.
+        _statement(conn, "BEGIN"; autocommit=false)
         conn.autocommit = false
-        try
-            _round_trip(conn, "BEGIN")
-        catch
-            conn.autocommit = true
-            rethrow()
-        end
+        _track(conn, "BEGIN")
     end
     return nothing
 end
@@ -408,7 +565,8 @@ function commit(conn::Connection)
     _check_open(conn)
     lock(conn.lock) do
         try
-            _round_trip(conn, "COMMIT")
+            _statement(conn, "COMMIT")
+            _track(conn, "COMMIT")
         finally
             conn.autocommit = true
         end
@@ -421,9 +579,10 @@ function rollback(conn::Connection)
     _check_open(conn)
     lock(conn.lock) do
         try
-            _round_trip(conn, "ROLLBACK")
+            _statement(conn, "ROLLBACK")
         finally
             conn.autocommit = true
+            conn.transaction_open = false
         end
     end
     return nothing
@@ -464,13 +623,22 @@ end
 
 # ---------------------------------------------------------------- transport
 
+# One `POST /api/execute`, with no recovery: the decoded answer, or `nothing`
+# when the engine refused the session as unknown and ran nothing.
 function _round_trip(conn::Connection, sql::String,
-                     multi_statement_count::Union{Int,Nothing}=nothing)
+                     multi_statement_count::Union{Int,Nothing}=nothing;
+                     autocommit::Union{Bool,Nothing}=nothing)
     endpoint = string(base_url(conn.config), "/api/execute")
+    id = conn.sessionid
+    # Resume this session or refuse: without the flag, an engine that no longer
+    # holds the session starts a fresh one under the same id, at its default
+    # scope, and runs the statement there. Only an engine known to read the flag
+    # is sent it; an older one's parser need not accept a field it does not know.
+    require_session = id !== nothing && conn.tracks_sessions === true
     payload = string("{\"sql\":", json_encode(sql),
-                     conn.sessionid === nothing ? "" :
-                     string(",\"sessionId\":", json_encode(conn.sessionid)),
-                     ",\"autoCommit\":", conn.autocommit ? "true" : "false",
+                     id === nothing ? "" : string(",\"sessionId\":", json_encode(id)),
+                     require_session ? ",\"requireSession\":true" : "",
+                     ",\"autoCommit\":", something(autocommit, conn.autocommit) ? "true" : "false",
                      # Absent unless the caller asked for a count: a request
                      # without the field is the one the server has always seen,
                      # and the session's value decides.
@@ -480,14 +648,39 @@ function _round_trip(conn::Connection, sql::String,
     status, body = _post(conn, endpoint, payload)
     decoded = _decode_body(endpoint, status, body)
 
-    session = get(decoded, "sessionId", nothing)
-    (session isa AbstractString && !isempty(session)) && (conn.sessionid = String(session))
+    # The one answer that names no session for a request that required one: the
+    # session is gone, and nothing ran.
+    if status == 404 && require_session && get(decoded, "success", nothing) !== true &&
+       get(decoded, "sessionId", nothing) === nothing
+        return nothing
+    end
+
+    _absorb_session(conn, decoded, id !== nothing)
 
     if get(decoded, "success", nothing) !== true
         throw(QueryError(_failure_message(decoded, status, body), sql; status=status))
     end
     conn.last_used_at = time_ns()
     return decoded
+end
+
+# Keeps the session an answer names, and learns from it whether the engine tracks
+# sessions: a `newSession` field, true or false, says it does.
+function _absorb_session(conn::Connection, decoded::AbstractDict, sent_id::Bool)
+    session = get(decoded, "sessionId", nothing)
+    (session isa AbstractString && !isempty(session)) || return nothing
+    conn.sessionid = String(session)
+    started = get(decoded, "newSession", nothing)
+    if started isa Bool
+        conn.tracks_sessions = true
+        # The engine ran the statement in a fresh session in place of ours:
+        # whatever the old one held is gone, and the DSN's scope goes back on
+        # before the next statement.
+        started && sent_id && _start_over(conn)
+    elseif conn.tracks_sessions === nothing
+        conn.tracks_sessions = false
+    end
+    return nothing
 end
 
 function _post(conn::Connection, endpoint::String, payload::String)

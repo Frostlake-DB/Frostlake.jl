@@ -14,7 +14,7 @@ talks to a running Frostlake server over its HTTP API and depends only on Julia'
 pkg> add Frostlake
 ```
 
-Requires Julia 1.10 or newer and a Frostlake engine 0.0.7 or newer.
+Requires Julia 1.10 or newer and a Frostlake engine 0.2.0 or newer.
 
 ## Example
 
@@ -30,6 +30,18 @@ close(conn)
 
 The [documentation](https://Frostlake-DB.github.io/Frostlake.jl/stable/) covers connection
 options, parameter binding, type mapping and known limitations.
+
+## Session lifetime
+
+Against an engine from 0.1.0 on, every request that names the connection's session sends
+`requireSession: true`, so a session the engine lost (an idle expiry, a release, a restart) is
+refused rather than quietly replaced at the server's default scope. The connection then puts the
+DSN's scope on a fresh session and sends the statement once more, or, when the lost session held
+an open transaction or context of the caller's own (`USE`, `SET`, `ALTER SESSION`, a temporary
+object), throws `SessionLostError` and stays usable. `close` releases the session with `DELETE
+/api/sessions/{id}`, which rolls back a transaction left open on it; it is best effort and never
+throws. An engine before 0.1.0 is sent neither. The documentation's *Transactions and sessions*
+page has the details.
 
 ## License
 

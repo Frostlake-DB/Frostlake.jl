@@ -12,7 +12,8 @@ const DEFAULT_CONNECT_TIMEOUT = 10.0
 const DEFAULT_REQUEST_TIMEOUT = 300.0
 
 # The engine reclaims a session after 30 minutes idle. Past that the driver has
-# to assume its own is gone, because nothing in a response says so.
+# to assume its own is gone when the engine predates 0.1.0, because nothing in
+# such an engine's response says so.
 const DEFAULT_IDLE_LIMIT = 1800.0
 
 # Everything the DSN query string may carry. Anything else is a typo, and a typo
@@ -40,7 +41,7 @@ struct Config
     connect_timeout::Float64
     "How long one statement may take; `0` removes the bound."
     timeout::Float64
-    "How long a connection may idle before the driver stops trusting its engine session; `0` switches the check off."
+    "How long a connection may idle before the driver stops trusting its engine session, against an engine before 0.1.0; `0` switches the check off."
     idle_limit::Float64
 end
 

@@ -58,5 +58,6 @@ utc
 FrostlakeError
 QueryError
 ConnectionError
+SessionLostError
 UsageError
 ```

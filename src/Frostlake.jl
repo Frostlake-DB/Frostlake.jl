@@ -35,7 +35,7 @@ export
     # values
     ZonedTimestamp, utc,
     # failures
-    FrostlakeError, ConnectionError, QueryError, UsageError
+    FrostlakeError, ConnectionError, QueryError, SessionLostError, UsageError
 
 # Two names are deliberately avoided, because a caller who also loads the
 # standard library module that owns them would find them ambiguous rather than

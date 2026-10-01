@@ -2,6 +2,7 @@ using Test
 
 include("testserver.jl")
 include("fakeserver.jl")
+include("scriptedserver.jl")
 
 @testset "Frostlake" begin
     # These need nothing installed — no engine, no JVM.
@@ -16,8 +17,11 @@ include("fakeserver.jl")
     # These boot a real engine from FROSTLAKE_CLASSPATH, and skip without one.
     include("connection_tests.jl")
 
-    # The runner for the engine-owned JSON suites lives outside this repo, so it
-    # is included only where it is present.
-    suites = joinpath(@__DIR__, "suites_tests.jl")
-    isfile(suites) && include(suites)
+    # A stand-in engine plays the session's lifetime out, and a real one
+    # confirms it; the real one is skipped without FROSTLAKE_CLASSPATH.
+    include("session_tests.jl")
+
+    # The engine's testkit corpus, replayed through the driver from the testkit
+    # directory FL_CORPUS names, and skipped without it.
+    include("suites_tests.jl")
 end

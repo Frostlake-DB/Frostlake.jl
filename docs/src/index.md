@@ -7,7 +7,7 @@ Julia's standard library: `Downloads` for the transport and `Dates` for temporal
 ## Requirements
 
 - Julia 1.10 or newer.
-- A Frostlake engine 0.0.7 or newer. `SELECT CURRENT_VERSION()` reports a server's version. The
+- A Frostlake engine 0.2.0 or newer. `SELECT CURRENT_VERSION()` reports a server's version. The
   driver speaks the HTTP protocol rather than linking the engine, so this is a minimum, not a
   pinned version.
 

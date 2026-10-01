@@ -2,7 +2,8 @@
 #
 # The split is the one a caller actually branches on: did the engine refuse the
 # statement (`QueryError`), did the request never become an answer
-# (`ConnectionError`), or did the driver never send it at all (`UsageError`)?
+# (`ConnectionError`), did the session it belonged to go away before it ran
+# (`SessionLostError`), or did the driver never send it at all (`UsageError`)?
 
 """
     FrostlakeError
@@ -68,6 +69,31 @@ QueryError(message::AbstractString, statement::AbstractString; status=nothing) =
     QueryError(String(message), String(statement), status)
 
 """
+    SessionLostError <: FrostlakeError
+
+The engine no longer holds the connection's session — it expired, was released,
+or the server restarted — and the statement did **not** run.
+
+A lost session is replaced without a word when nothing went with it: the DSN's
+scope goes onto a fresh session and the statement is sent once more. This is
+thrown instead when the lost session held something a fresh one cannot
+reproduce — an open transaction, or context set up with `USE`, `SET`,
+`ALTER SESSION` or a temporary object — because re-running the statement would
+put it somewhere its author did not intend.
+
+The connection stays usable: the next statement starts a fresh session on the
+DSN's scope. Whatever the unit of work had done in the lost session is gone, so
+it is the unit of work that has to start over.
+
+`statement` is the SQL that did not run, **after parameter substitution** — as
+sensitive as `QueryError.statement`.
+"""
+struct SessionLostError <: FrostlakeError
+    message::String
+    statement::String
+end
+
+"""
     UsageError <: FrostlakeError
 
 The driver was asked for something impossible and never sent a request: a
@@ -83,3 +109,4 @@ UsageError(message::AbstractString) = UsageError(String(message))
 Base.showerror(io::IO, e::ConnectionError) = print(io, "ConnectionError: ", e.message)
 Base.showerror(io::IO, e::QueryError) = print(io, "QueryError: ", e.message)
 Base.showerror(io::IO, e::UsageError) = print(io, "UsageError: ", e.message)
+Base.showerror(io::IO, e::SessionLostError) = print(io, "SessionLostError: ", e.message)

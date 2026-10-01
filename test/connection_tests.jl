@@ -281,12 +281,14 @@ end
             end
 
             @testset "an idle session is put back on the DSN's scope" begin
-                # The engine reclaims an idle session and quietly builds a fresh
-                # one for the same id, losing the scope. Nothing in the reply
-                # gives it away, so past `idleLimit` the driver re-applies the
-                # DSN's scope. Dropping the database in between is what makes
-                # that observable: the re-applied USE is the statement that
-                # fails.
+                # An engine before 0.1.0 reclaims an idle session and quietly
+                # builds a fresh one for the same id, losing the scope. Nothing
+                # in the reply gives it away, so past `idleLimit` the driver
+                # re-applies the DSN's scope. An engine that reports newSession
+                # refuses a lost session instead, and the statement that finds
+                # it gone puts the scope back, so it needs no clock. Dropping the
+                # database in between is what makes the difference observable:
+                # a re-applied USE is the statement that fails.
                 execute(conn, "CREATE OR REPLACE DATABASE idle_db")
                 idle = Connection("$(server.dsn)/idle_db?idleLimit=1ms")
                 try
@@ -294,7 +296,11 @@ end
                           "IDLE_DB"
                     execute(conn, "DROP DATABASE idle_db")
                     sleep(0.05)
-                    @test_throws QueryError execute(idle, "SELECT 1")
+                    if idle.tracks_sessions === true
+                        @test scalar(execute(idle, "SELECT 1")) == 1
+                    else
+                        @test_throws QueryError execute(idle, "SELECT 1")
+                    end
                 finally
                     close(idle)
                 end

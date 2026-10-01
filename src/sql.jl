@@ -232,6 +232,62 @@ function _names_object(words, want)
 end
 
 """
+    touches_session(statement) -> Bool
+
+Whether one statement leaves behind state a fresh session would not have: a
+moved scope or a session setting (everything `changes_session_scope`
+spots), or a temporary object.
+
+A session holding such state cannot be quietly swapped for a new one when the
+engine loses it: the statement would run somewhere its author did not intend.
+"""
+touches_session(statement::AbstractString) =
+    _statement_changes_scope(statement) || _creates_temporary(String(statement))
+
+# The words that may sit between CREATE and the kind of object it makes.
+const _CREATE_MODIFIERS = ("OR", "REPLACE", "TRANSIENT", "TEMPORARY", "TEMP",
+                           "VOLATILE", "LOCAL", "GLOBAL", "SECURE", "IF", "NOT",
+                           "EXISTS", "PUBLIC", "PRIVATE", "ICEBERG", "DYNAMIC",
+                           "HYBRID", "EVENT", "RECURSIVE", "MATERIALIZED",
+                           "EXTERNAL")
+
+const _TEMPORARY = ("TEMPORARY", "TEMP", "VOLATILE")
+
+# `CREATE TEMPORARY TABLE`, `CREATE OR REPLACE TEMP STAGE` and the like: an
+# object that lives exactly as long as the session.
+function _creates_temporary(statement::String)
+    words = leading_words(statement, 16)
+    (isempty(words) || words[1] != "CREATE") && return false
+    for word in words[2:end]
+        word in _TEMPORARY && return true
+        word in _CREATE_MODIFIERS || return false
+    end
+    return false
+end
+
+"""
+    transaction_effect(statement) -> Symbol
+
+What one statement does to the session's transaction: `:begins` for `BEGIN` on
+its own (or with `TRANSACTION`, `WORK` or `NAME`) and `START TRANSACTION`,
+`:ends` for `COMMIT` and `ROLLBACK`, `:none` for anything else. `BEGIN`
+followed by a statement opens a Snowflake Scripting block, not a transaction.
+"""
+function transaction_effect(statement::AbstractString)
+    words = leading_words(String(statement), 2)
+    isempty(words) && return :none
+    verb = words[1]
+    if verb == "BEGIN"
+        (length(words) == 1 || words[2] in ("TRANSACTION", "WORK", "NAME")) && return :begins
+    elseif verb == "START"
+        (length(words) == 2 && words[2] == "TRANSACTION") && return :begins
+    elseif verb == "COMMIT" || verb == "ROLLBACK"
+        return :ends
+    end
+    return :none
+end
+
+"""
     leading_words(statement, n) -> Vector{String}
 
 Up to `n` words from the start of a statement, upper-cased, skipping whitespace

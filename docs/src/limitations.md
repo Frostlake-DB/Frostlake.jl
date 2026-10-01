@@ -1,16 +1,12 @@
 # Known limitations
 
-These hold for engine 0.1.0, the current release. Engine 0.0.7 adds the differences listed at the
+These hold for engine 0.2.0, the current release. Engine 0.0.7 adds the differences listed at the
 end.
 
-- **Sessions are not released on close.** The driver never ends its server session, so a closed
-  connection's session remains until the engine's 30-minute idle expiry removes it. Opening many
-  short-lived connections accumulates server-side sessions.
-- **An expired session silently resumes at the server's default scope.** The engine starts a fresh
-  session under the expired one's id; it flags this with `newSession`, which the driver does not
-  read yet. The driver re-applies the DSN's scope to a connection idle longer than `idleLimit`, but
-  other session state (variables, `ALTER SESSION` settings) is lost. It stops re-applying once the
-  caller issues their own `USE`, because the DSN no longer describes the session.
+- **A lost session takes its state with it.** When the engine no longer holds a connection's
+  session, the connection replaces it on the DSN's scope only when nothing of the caller's own went
+  with it; otherwise it throws [`SessionLostError`](@ref) and the unit of work has to start over.
+  See [Session lifetime](@ref).
 - **A `DateTime` holds milliseconds.** The engine sends timestamps with nanoseconds, but a
   `TIMESTAMP_NTZ` and the wall clock of a [`ZonedTimestamp`](@ref) are Julia `DateTime`s, so digits
   beyond the millisecond do not survive. `TO_VARCHAR(ts, 'YYYY-MM-DD HH24:MI:SS.FF9')` reads them.
@@ -32,3 +28,10 @@ end.
   is off by the original offset.
 - An empty statement is refused by the HTTP endpoint with `SQL is required`.
 - Columns carry no `length`.
+- **An expired session silently resumes at the server's default scope.** The engine starts a fresh
+  session under the expired one's id, and nothing in its answer says so. The driver re-applies the
+  DSN's scope to a connection idle longer than `idleLimit`, but other session state (variables,
+  `ALTER SESSION` settings) is lost. It stops re-applying once the caller issues their own `USE`,
+  because the DSN no longer describes the session.
+- **Sessions are not released on close.** The engine has no endpoint for it, so a closed
+  connection's session remains until the engine's 30-minute idle expiry removes it.

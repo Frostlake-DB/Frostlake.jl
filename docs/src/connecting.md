@@ -38,7 +38,7 @@ address in brackets: `frostlake://[::1]:18082`.
 | `warehouse` | warehouse to `USE` on the session | — |
 | `timeout` | how long one statement may take; `0` removes the limit | `5m` |
 | `connectTimeout` | how long to wait for the socket | `10s` |
-| `idleLimit` | idle time after which the DSN's scope is re-applied; `0` disables the check | `30m` |
+| `idleLimit` | against an engine before 0.1.0, idle time after which the DSN's scope is re-applied; `0` disables the check | `30m` |
 | `tls` | `true` to use HTTPS, like an `https://` DSN | `false` |
 
 Durations are a number of seconds or carry an `ms`, `s`, `m` or `h` suffix. An unknown parameter
