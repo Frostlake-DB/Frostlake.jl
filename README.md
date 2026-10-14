@@ -43,6 +43,13 @@ object), throws `SessionLostError` and stays usable. `close` releases the sessio
 throws. An engine before 0.1.0 is sent neither. The documentation's *Transactions and sessions*
 page has the details.
 
+## AI assistance
+
+This package (the source code, the tests, the documentation and the CI configuration) was
+generated with [Claude Code](https://claude.com/claude-code), Anthropic's AI coding assistant,
+working under the maintainer's direction. The maintainer reviewed each change before committing
+it. The tests run in CI against a released Frostlake engine, and coverage is tracked on Codecov.
+
 ## License
 
 Apache-2.0; see [LICENSE](LICENSE).
