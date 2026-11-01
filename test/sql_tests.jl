@@ -20,6 +20,9 @@ using Frostlake: skip_enclosure, skip_string, skip_quoted, skip_dollar_quoted,
 
         @test skip_enclosure("-- comment\nSELECT", 1) == 12
         @test skip_enclosure("// comment\nSELECT", 1) == 12
+        # A line comment ends at a carriage return as well, whichever comes first.
+        @test skip_enclosure("-- comment\rSELECT", 1) == 12
+        @test skip_enclosure("// comment\r\nSELECT", 1) == 12
         @test skip_enclosure("/* c */ SELECT", 1) == 8
         @test skip_enclosure("/* unterminated", 1) == 16
         @test skip_enclosure("- x", 1) == 0
@@ -41,6 +44,8 @@ using Frostlake: skip_enclosure, skip_string, skip_quoted, skip_dollar_quoted,
         @test length(split_statements("SELECT \"a;b\"")) == 1
         @test length(split_statements("SELECT 1 -- ;\n")) == 1
         @test length(split_statements("CREATE FUNCTION f() AS \$\$ a; b \$\$")) == 1
+        @test length(split_statements("SELECT 1 -- c\r; SELECT 2")) == 2
+        @test length(split_statements("SELECT 1 AS a\$\$b; SELECT 2")) == 2
         @test split_statements("SELECT 1;") == ["SELECT 1", ""]
     end
 
@@ -61,6 +66,7 @@ using Frostlake: skip_enclosure, skip_string, skip_quoted, skip_dollar_quoted,
         end
         # A leading comment is stepped over, a leading literal is not a keyword.
         @test changes_session_scope("/* c */ USE DATABASE db")
+        @test changes_session_scope("-- c\rUSE DATABASE db")
         @test !changes_session_scope("'USE' DATABASE db")
     end
 
@@ -81,6 +87,7 @@ using Frostlake: skip_enclosure, skip_string, skip_quoted, skip_dollar_quoted,
     @testset "leading words" begin
         @test leading_words("select  Distinct * from t", 3) == ["SELECT", "DISTINCT"]
         @test leading_words("-- c\n/* c */ USE DATABASE db", 2) == ["USE", "DATABASE"]
+        @test leading_words("-- c\rBEGIN", 2) == ["BEGIN"]
         @test leading_words("", 3) == String[]
         @test leading_words("'literal'", 3) == String[]
         @test length(leading_words("a b c d e f g", 4)) == 4

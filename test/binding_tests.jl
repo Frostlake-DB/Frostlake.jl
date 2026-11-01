@@ -78,6 +78,13 @@ using Frostlake: scan_placeholders, placeholder_count, placeholder_names,
         @test format_literal(-1.5) == "(-1.5)"
         @test substitute_positional("SELECT 3-?", [-5]) == "SELECT 3-(-5)"
         @test substitute_positional("SELECT 3-?", [5]) == "SELECT 3-5"
+        # Bare, ?::VARCHAR would cast before it negates.
+        @test substitute_positional("SELECT ?::VARCHAR", [-5]) == "SELECT (-5)::VARCHAR"
+        @test substitute_positional("SELECT 3-?", [-2.5]) == "SELECT 3-(-2.5)"
+        @test substitute_positional("SELECT 3-?", [big"-123456789012345678901234567890"]) ==
+              "SELECT 3-(-123456789012345678901234567890)"
+        # Judged on the text: -0.0 is not below zero, but it is written with a minus.
+        @test format_literal(-0.0) == "(-0.0)"
         @test format_literal(big"123456789012345678901234567890") ==
               "123456789012345678901234567890"
         @test format_literal(1.5) == "1.5"
@@ -122,6 +129,16 @@ using Frostlake: scan_placeholders, placeholder_count, placeholder_names,
 
         @test_throws UsageError format_literal(:symbol)
         @test_throws UsageError format_literal(1 + 2im)
+    end
+
+    @testset "text read as the lexer reads it" begin
+        # A name is read whole, so the $$ inside a$$b opens no body.
+        @test substitute_positional("SELECT 1 AS a\$\$b, ?", [7]) == "SELECT 1 AS a\$\$b, 7"
+        # A line comment ends at a carriage return as well as at a line feed.
+        @test substitute_positional("SELECT 1 -- c\r, ?", [7]) == "SELECT 1 -- c\r, 7"
+        @test substitute_positional("SELECT 1 // c\r, ?", [7]) == "SELECT 1 // c\r, 7"
+        @test substitute_named("SELECT 1 -- c\r, :n", Dict("n" => 7)) == "SELECT 1 -- c\r, 7"
+        @test placeholder_count("SELECT 1 -- c\r\n, ?") == 1
     end
 
     @testset "markers next to text outside ASCII" begin

@@ -103,10 +103,16 @@ function skip_dollar_quoted(sql::String, i::Int)
     return stop === nothing ? ncodeunits(sql) + 1 : last(stop) + 1
 end
 
-"The index just past the line comment starting at `i`."
+"""
+    skip_line(sql, i) -> Int
+
+The index just past the line comment starting at `i`. It ends at a line feed or
+a carriage return, whichever comes first, as the lexer's `LINE_COMMENT` does: a
+`?` on the far side of a lone carriage return is a placeholder.
+"""
 function skip_line(sql::String, i::Int)
-    stop = findnext("\n", sql, i)
-    return stop === nothing ? ncodeunits(sql) + 1 : last(stop) + 1
+    stop = findnext(in(('\n', '\r')), sql, i)
+    return stop === nothing ? ncodeunits(sql) + 1 : stop + 1
 end
 
 "The index just past the block comment starting at `i`."

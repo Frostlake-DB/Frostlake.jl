@@ -41,7 +41,8 @@ end
                           "create or replace temp stage st",
                           "CREATE LOCAL VOLATILE TABLE t (a INT)",
                           "CREATE OR REPLACE SECURE TEMPORARY VIEW v AS SELECT 1",
-                          "-- note\nCREATE TEMP TABLE t (a INT)"]
+                          "-- note\nCREATE TEMP TABLE t (a INT)",
+                          "-- note\rCREATE TEMP TABLE t (a INT)"]
             @test touches_session(statement)
         end
         for statement in ["SELECT 1", "CREATE TABLE t (a INT)",
@@ -51,7 +52,7 @@ end
             @test !touches_session(statement)
         end
         for statement in ["BEGIN", "begin transaction", "BEGIN WORK", "BEGIN NAME t1",
-                          "START TRANSACTION"]
+                          "START TRANSACTION", "-- note\rBEGIN"]
             @test transaction_effect(statement) === :begins
         end
         for statement in ["COMMIT", "ROLLBACK", "commit work"]

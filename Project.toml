@@ -1,6 +1,6 @@
 name = "Frostlake"
 uuid = "40092d52-7b49-45a8-b7a0-7762832bafd1"
-version = "0.1.0"
+version = "0.1.1"
 
 [deps]
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
